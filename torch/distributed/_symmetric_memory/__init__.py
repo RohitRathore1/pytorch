@@ -14,6 +14,7 @@ from typing_extensions import deprecated
 
 import torch
 import torch.distributed._functional_collectives as funcol
+import torch.nn.functional as F
 import torch.distributed.distributed_c10d as c10d
 from torch._C._autograd import DeviceType
 from torch._C._distributed_c10d import _SymmetricMemory, Work as _Work
@@ -468,6 +469,18 @@ lib.define(
     "Tensor? result_scale = None, "
     "ScalarType? out_dtype = None, "
     "bool use_fast_accum = False) -> Tensor",
+    tags=[torch._C.Tag.needs_fixed_stride_order],
+)
+lib.define(
+    "fused_matmul_allreduce("
+    "Tensor A, Tensor B, str reduce_op, str group_name"
+    ") -> Tensor",
+    tags=[torch._C.Tag.needs_fixed_stride_order],
+)
+lib.define(
+    "fused_allreduce_rmsnorm("
+    "Tensor input, Tensor weight, float eps, str reduce_op, str group_name"
+    ") -> Tensor",
     tags=[torch._C.Tag.needs_fixed_stride_order],
 )
 lib.define("_low_contention_all_gather(Tensor tensor, str group_name) -> Tensor")
@@ -1587,6 +1600,172 @@ def restride_A_for_fused_matmul_reduce_scatter(
     return make_contiguous_for_perm(t, perm)
 
 
+@torch.library.impl(lib, "fused_matmul_allreduce", "Meta")
+def _fused_matmul_allreduce_fallback(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    reduce_op: str,
+    group_name: c10d.GroupName,
+) -> torch.Tensor:
+    out = A @ B
+    out = funcol.all_reduce(out, reduce_op, group_name)
+    return funcol.wait_tensor(out)
+
+
+@torch.library.impl(lib, "fused_matmul_allreduce", "CUDA")
+def _fused_matmul_allreduce(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    reduce_op: str,
+    group_name: c10d.GroupName,
+) -> torch.Tensor:
+    """
+    Perform the following logic with micro-pipelined computation and
+    communication:
+
+        all_reduce(A @ B, reduce_op, group_name)
+
+    Each rank computes a chunk of the matmul output, exchanges chunks via P2P,
+    and accumulates contributions from all ranks.
+    """
+    if _is_test_mode:
+        return _fused_matmul_allreduce_fallback(A, B, reduce_op, group_name)
+
+    with torch.profiler.record_function("fused_matmul_allreduce"):
+        return _fused_matmul_allreduce_impl(A, B, reduce_op, group_name)
+
+
+_ONE_SHOT_THRESHOLD_BYTES = 256 * 1024
+_TWO_SHOT_THRESHOLD_BYTES = 10 * 1024 * 1024
+
+
+def _optimized_allreduce(
+    data: torch.Tensor,
+    reduce_op: str,
+    group_name: c10d.GroupName,
+) -> torch.Tensor:
+    if reduce_op not in ("sum", "avg"):
+        raise ValueError("reduce_op must be 'sum' or 'avg'")
+
+    group = c10d._resolve_process_group(group_name)
+    world_size = group.size()
+    data_size_bytes = data.numel() * data.element_size()
+
+    can_use_kernels = (
+        data.dtype in (torch.float32, torch.bfloat16)
+        and data.is_contiguous()
+        and data_size_bytes > 0
+    )
+
+    if can_use_kernels and data_size_bytes <= _TWO_SHOT_THRESHOLD_BYTES:
+        symm_mem = get_symm_mem_workspace(group_name, data_size_bytes)
+        symm_buf = symm_mem.get_buffer(symm_mem.rank, data.shape, data.dtype)
+        output = torch.empty_like(data)
+
+        if data_size_bytes <= _ONE_SHOT_THRESHOLD_BYTES:
+            torch.ops.symm_mem.one_shot_all_reduce_copy_out(
+                symm_buf, data, "sum", group_name, output
+            )
+        else:
+            symm_buf.copy_(data)
+            torch.ops.symm_mem.two_shot_all_reduce_out(
+                symm_buf, "sum", group_name, output
+            )
+
+        if reduce_op == "avg":
+            output.div_(world_size)
+        return output
+
+    symm_mem = get_symm_mem_workspace(group_name, data_size_bytes)
+    rank = symm_mem.rank
+    buf = symm_mem.get_buffer(rank, data.shape, data.dtype)
+    buf.copy_(data)
+    symm_mem.barrier(channel=0)
+
+    backend_stream = _get_backend_stream(priority=-1)
+    backend_stream.wait_stream(torch.cuda.current_stream())
+    output = data.clone()
+    for step in range(1, world_size):
+        src_rank = (rank + step) % world_size
+        remote_buf = symm_mem.get_buffer(src_rank, data.shape, data.dtype)
+        with backend_stream:
+            output.add_(remote_buf)
+    torch.cuda.current_stream().wait_stream(backend_stream)
+
+    if reduce_op == "avg":
+        output.div_(world_size)
+    symm_mem.barrier(channel=0)
+    return output
+
+
+def _fused_matmul_allreduce_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    reduce_op: str,
+    group_name: c10d.GroupName,
+) -> torch.Tensor:
+    if A.dim() < 2:
+        raise ValueError("A must be at least a 2D tensor")
+    if B.dim() != 2:
+        raise ValueError("B must be a 2D matrix")
+
+    A_flat = A.flatten(0, -2)
+    N = B.shape[1]
+    C_local = A_flat @ B
+    output = _optimized_allreduce(C_local, reduce_op, group_name)
+    return output.view(*A.shape[:-1], N)
+
+
+@torch.library.impl(lib, "fused_allreduce_rmsnorm", "Meta")
+def _fused_allreduce_rmsnorm_fallback(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    reduce_op: str,
+    group_name: c10d.GroupName,
+) -> torch.Tensor:
+    reduced = funcol.all_reduce(input, reduce_op, group_name)
+    reduced = funcol.wait_tensor(reduced)
+    return F.rms_norm(reduced, list(weight.shape), weight, eps)
+
+
+@torch.library.impl(lib, "fused_allreduce_rmsnorm", "CUDA")
+def _fused_allreduce_rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    reduce_op: str,
+    group_name: c10d.GroupName,
+) -> torch.Tensor:
+    """
+    Perform allreduce + RMSNorm in a single fused operation. The allreduce
+    result stays hot in cache when RMSNorm is applied, avoiding an extra
+    global memory round-trip.
+    """
+    if _is_test_mode:
+        return _fused_allreduce_rmsnorm_fallback(
+            input, weight, eps, reduce_op, group_name
+        )
+
+    with torch.profiler.record_function("fused_allreduce_rmsnorm"):
+        return _fused_allreduce_rmsnorm_impl(
+            input, weight, eps, reduce_op, group_name
+        )
+
+
+def _fused_allreduce_rmsnorm_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    reduce_op: str,
+    group_name: c10d.GroupName,
+) -> torch.Tensor:
+    flat = input.flatten(0, -2)
+    output = _optimized_allreduce(flat, reduce_op, group_name)
+    result = F.rms_norm(output, list(weight.shape), weight, eps)
+    return result.view_as(input)
+
+
 def _maybe_convert_scalar_types_to_dtypes(
     scalar_types: list[Any],
 ) -> list[torch.dtype | None]:
@@ -2047,6 +2226,35 @@ def get_backend(device: _device) -> str | None:
     return _SymmetricMemory.get_backend(torch.device(device))
 
 
+_group_backend_overrides: dict[str, str] = {}
+
+
+def set_group_backend(group_name: str, backend: str) -> None:
+    r"""
+    Set the preferred symmetric memory backend for a specific process group.
+
+    Unlike :func:`set_backend` which is global, this allows different groups
+    to prefer different backends (e.g., CUDA for TP, NVSHMEM for EP in MoE
+    models). The per-group preference is used by fused ops to select the
+    appropriate code path.
+
+    Args:
+        group_name (str): the name of the process group.
+        backend (str): the backend name (e.g., ``"CUDA"``, ``"NVSHMEM"``).
+    """
+    _group_backend_overrides[group_name] = backend
+
+
+def get_group_backend(group_name: str) -> str | None:
+    r"""
+    Get the preferred symmetric memory backend for a specific process group.
+
+    Returns:
+        The backend name if set, otherwise ``None``.
+    """
+    return _group_backend_overrides.get(group_name)
+
+
 def get_mempool_allocator(device: _device):  # type: ignore[no-untyped-def]
     r"""
     Get the MemPool allocator for symmetric memory for a given device.
@@ -2299,4 +2507,6 @@ __all__ = [
     "get_signal_pad_size",
     "get_mem_pool",
     "reduce_scatter_offset",
+    "set_group_backend",
+    "get_group_backend",
 ]

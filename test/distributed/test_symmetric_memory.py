@@ -22,10 +22,14 @@ from torch.distributed._functional_collectives import all_gather_tensor
 from torch.distributed._symmetric_memory import (
     _fused_all_gather_matmul_fallback,
     _fused_all_gather_scaled_matmul_fallback,
+    _fused_allreduce_rmsnorm_fallback,
+    _fused_matmul_allreduce_fallback,
     _fused_matmul_reduce_scatter_fallback,
     _test_mode,
+    get_group_backend,
     restride_A_for_fused_matmul_reduce_scatter,
     restride_A_shard_for_fused_all_gather_matmul,
+    set_group_backend,
 )
 from torch.testing._internal.common_cuda import (
     SM100OrLater,
@@ -1267,6 +1271,139 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
         ref = torch.ops._c10d_functional.wait_tensor(ref)
 
         self.assertTrue(out.eq(ref).all())
+
+
+@instantiate_parametrized_tests
+@requires_cuda_p2p_access()
+class FusedOpsTest(MultiProcContinuousTest):
+    def _init_process(self) -> None:
+        torch.cuda.set_device(self.device)
+        torch.manual_seed(42 + self.rank)
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device(device_type, self.rank)
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_fused_matmul_allreduce(self) -> None:
+        self._init_process()
+
+        M = 64
+        K = 32
+        N = 16
+        group = dist.group.WORLD
+
+        torch.manual_seed(42 + self.rank)
+        A = torch.rand(M, K, device="cuda")
+        B = torch.rand(K, N, device="cuda")
+
+        ref = _fused_matmul_allreduce_fallback(
+            A, B, reduce_op="sum", group_name=group.group_name
+        )
+        result = torch.ops.symm_mem.fused_matmul_allreduce(
+            A, B, reduce_op="sum", group_name=group.group_name
+        )
+
+        self.assertTrue(
+            torch.allclose(ref, result, atol=1e-4, rtol=1e-4),
+            f"fused_matmul_allreduce mismatch: max diff={torch.max(torch.abs(ref - result))}",
+        )
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_fused_allreduce_rmsnorm(self) -> None:
+        self._init_process()
+
+        M = 64
+        N = 32
+        eps = 1e-5
+        group = dist.group.WORLD
+
+        torch.manual_seed(42 + self.rank)
+        input = torch.rand(M, N, device="cuda")
+        weight = torch.rand(N, device="cuda")
+
+        ref = _fused_allreduce_rmsnorm_fallback(
+            input, weight, eps, reduce_op="sum", group_name=group.group_name
+        )
+        result = torch.ops.symm_mem.fused_allreduce_rmsnorm(
+            input, weight, eps, reduce_op="sum", group_name=group.group_name
+        )
+
+        self.assertTrue(
+            torch.allclose(ref, result, atol=1e-4, rtol=1e-4),
+            f"fused_allreduce_rmsnorm mismatch: max diff={torch.max(torch.abs(ref - result))}",
+        )
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_fused_matmul_allreduce_avg(self) -> None:
+        self._init_process()
+
+        M, K, N = 64, 32, 16
+        group = dist.group.WORLD
+
+        torch.manual_seed(42 + self.rank)
+        A = torch.rand(M, K, device="cuda")
+        B = torch.rand(K, N, device="cuda")
+
+        ref = _fused_matmul_allreduce_fallback(
+            A, B, reduce_op="avg", group_name=group.group_name
+        )
+        result = torch.ops.symm_mem.fused_matmul_allreduce(
+            A, B, reduce_op="avg", group_name=group.group_name
+        )
+
+        self.assertTrue(
+            torch.allclose(ref, result, atol=1e-4, rtol=1e-4),
+            f"fused_matmul_allreduce avg mismatch: max diff={torch.max(torch.abs(ref - result))}",
+        )
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_fused_allreduce_rmsnorm_avg(self) -> None:
+        self._init_process()
+
+        M, N, eps = 64, 32, 1e-5
+        group = dist.group.WORLD
+
+        torch.manual_seed(42 + self.rank)
+        input = torch.rand(M, N, device="cuda")
+        weight = torch.rand(N, device="cuda")
+
+        ref = _fused_allreduce_rmsnorm_fallback(
+            input, weight, eps, reduce_op="avg", group_name=group.group_name
+        )
+        result = torch.ops.symm_mem.fused_allreduce_rmsnorm(
+            input, weight, eps, reduce_op="avg", group_name=group.group_name
+        )
+
+        self.assertTrue(
+            torch.allclose(ref, result, atol=1e-4, rtol=1e-4),
+            f"fused_allreduce_rmsnorm avg mismatch: max diff={torch.max(torch.abs(ref - result))}",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    def test_per_group_backend(self) -> None:
+        self._init_process()
+
+        group = dist.group.WORLD
+        group_name = group.group_name
+
+        self.assertIsNone(get_group_backend(group_name))
+        set_group_backend(group_name, "CUDA")
+        self.assertEqual(get_group_backend(group_name), "CUDA")
+        set_group_backend(group_name, "NVSHMEM")
+        self.assertEqual(get_group_backend(group_name), "NVSHMEM")
 
 
 @instantiate_parametrized_tests

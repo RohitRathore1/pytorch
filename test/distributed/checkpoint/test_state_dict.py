@@ -1109,6 +1109,31 @@ class TestNoComm(MultiProcessTestCase):
         set_optimizer_state_dict(model, optim, osd)
         set_optimizer_state_dict(model, optim, optim.state_dict())
 
+    @skip_if_lt_x_gpu(1)
+    def test_get_optimizer_state_dict_does_not_modify_optimizer(self) -> None:
+        """Regression test for https://github.com/pytorch/pytorch/issues/164929"""
+
+        def run_one_step(mat, call_get_sd):
+            model = nn.Linear(5, 5, bias=False, device=device_type)
+            model.weight.data.copy_(mat)
+            opt = torch.optim.AdamW(model.parameters(), lr=0.1)
+            if call_get_sd:
+                get_optimizer_state_dict(
+                    model, opt, options=StateDictOptions(full_state_dict=True)
+                )
+                # All state values should be at their initial (zero) values
+                for param_state in opt.state.values():
+                    if "step" in param_state:
+                        self.assertEqual(param_state["step"].item(), 0)
+            model.weight.grad = mat.clone()
+            opt.step()
+            return model.weight
+
+        fake = torch.randn(5, 5, device=device_type)
+        result_with = run_one_step(fake, True)
+        result_without = run_one_step(fake, False)
+        torch.testing.assert_close(result_with, result_without)
+
 
 if __name__ == "__main__":
     run_tests()

@@ -643,9 +643,11 @@ def _init_optim_state(optim: torch.optim.Optimizer) -> None:
             if param.grad is not None:
                 return
 
+    saved_param_data = {}
     for param_group in optim.param_groups:
         for param in param_group[_PARAMS]:
             if param.requires_grad:
+                saved_param_data[param] = param.data.clone()
                 param.grad = torch.zeros_like(param)
 
     # Some optimizers will update parameters regardless of grads due to lr, so
@@ -660,12 +662,21 @@ def _init_optim_state(optim: torch.optim.Optimizer) -> None:
                 else 0.0
             )
     optim.step(closure=None)
-    # Whether to recover the "lr" should not matter too much as we will
-    # restore checkpointing later.
     for param_group in optim.param_groups:
         if "lr" in param_group:
             param_group["lr"] = lrs.pop(0)
     optim.zero_grad(set_to_none=True)
+
+    # step() was only needed to discover the state structure (keys and tensor
+    # shapes). Undo its side-effects: reset all state values and restore params.
+    for state in optim.state.values():
+        for key, val in state.items():
+            if isinstance(val, torch.Tensor):
+                val.zero_()
+            elif isinstance(val, (int, float)):
+                state[key] = type(val)(0)
+    for param, data in saved_param_data.items():
+        param.data.copy_(data)
 
 
 def _flatten_optim_state_dict(state_dict: OptimizerStateType) -> dict[str, ValueType]:
